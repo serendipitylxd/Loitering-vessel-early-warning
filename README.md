@@ -7,12 +7,12 @@ To address these challenges, this project builds a **temporally coherent loiteri
 Compared with conventional rule-based or single-frame methods, the proposed framework is designed to provide **more robust loitering recognition**, **fewer false alarms**, and **better temporal consistency** in complex lock environments.
 
 **Highlights**: 
-* Multi-modal back-end fusion** of image-based 2D detections and LiDAR-based 3D detections
-* Temporally coherent scene understanding** for lock operation analysis
-* Gate-state inference** based on lock-gate observations and temporal trends
-* Trajectory-based vessel behavior reasoning** for entry, exit, and staying analysis
-* Loitering early warning** with reduced false alarms through temporal refinement
-* Support for virtual vessel compensation** and Kalman-based smoothing in challenging scenes
+* **Multi-modal back-end fusion** of image-based 2D detections and LiDAR-based 3D detections
+* **Temporally coherent scene understanding** for lock operation analysis
+* **Gate-state inference** based on lock-gate observations and temporal trends
+* **Trajectory-based vessel behavior reasoning** for entry, exit, and staying analysis
+* **Loitering early warning** with reduced false alarms through temporal refinement
+* **Support for virtual vessel compensation** and Kalman-based smoothing in challenging scenes
 
 
 ## Overview
