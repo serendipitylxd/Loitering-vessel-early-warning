@@ -1,0 +1,133 @@
+# Basic data paths
+data:
+  images_dir: "/path/to/coco_TROUT/test2017"          # Test image directory (for 2D)
+  points_dir: "/path/to/TROUT/points_test"          # Test point cloud directory (.bin/.npy/.pcd) (for 3D)
+  frame_id_regex: "^(.*)\\.(jpg|png|jpeg|bin|npy|pcd)$"   # Use filename without extension as frame_id
+
+# 2D models (multiple models can be configured; gate existence uses OR logic)
+mmdet_models:
+  - name: "atss"
+    config: "/path/to/mmdet_models/config/atss_r50_fpn_1x_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/atss.pth"
+    score_thr: 0.40
+
+  - name: "convnext"
+    config: "/path/to/mmdet_models/config/cascade-mask-rcnn_convnext-t-p4-w7_fpn_4conv1fc-giou_amp-ms-crop-3x_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/convnext.pth"
+    score_thr: 0.40
+    
+  - name: "dab-detr"
+    config: "/path/to/mmdet_models/config/dab-detr_r50_8xb2-50e_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/dab-detr.pth"
+    score_thr: 0.40
+
+  - name: "ddq"
+    config: "/path/to/mmdet_models/config/ddq-detr-4scale_r50_8xb2-12e_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/ddq.pth"
+    score_thr: 0.40
+
+  - name: "dino"
+    config: "/path/to/mmdet_models/config/dino-4scale_r50_8xb2-12e_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/dino.pth"
+    score_thr: 0.40
+    
+  - name: "yolox"
+    config: "/path/to/mmdet_models/config/yolox_s_8xb8-300e_coco.py"
+    checkpoint: "/path/to/mmdet_models/checkpoint/yolox.pth"
+    score_thr: 0.40
+
+  #- name: "ddq_r50"
+    #config: "/path/to/mmdet/ddq_config.py"
+    #checkpoint: "/path/to/ddq.pth"
+    #score_thr: 0.40
+
+
+# 3D models (multiple models can be configured; ship boxes are merged in output;
+# gate detections also participate in OR logic if this class is included)
+pcdet_models:
+
+  - name: "pointpillar"
+    config: "/path/to/pcdet_models/config/pointpillar.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/pointpillar.pth"
+    score_thr: 0.40
+
+  - name: "second"
+    config: "/path/to/pcdet_models/config/second.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/second.pth"
+    core_thr: 0.40
+
+  - name: "dsvt_voxel"
+    config: "/path/to/pcdet_models/config/dsvt_voxel.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/dsvt_voxel.pth"
+    score_thr: 0.40
+
+  - name: "voxel_mamba"
+    config: "/path/to/pcdet_models/config/voxel_mamba.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/voxel_mamba.pth"
+    score_thr: 0.40
+
+  - name: "pv_rcnn"
+    config: "/path/to/pcdet_models/config/pv_rcnn.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/pv_rcnn.pth"
+    score_thr: 0.40
+
+  - name: "pv_rcnn_plusplus"
+    config: "/path/to/pcdet_models/config/pv_rcnn_plusplus.yaml"
+    checkpoint: "/path/to/pcdet_models/checkpoint/pv_rcnn_plusplus.pth"
+    score_thr: 0.40
+
+
+# Semantic labels
+labels:
+  lock_gate: "Lock_gate"
+  ships: ["Fully_loaded_cargo_ship", "Fully_loaded_container_ship", "Unladen_cargo_ship"]
+
+virtual_ship_repair:
+  enabled: true
+  max_gap_frames: 2
+  min_prev_hist_frames: 2
+  max_step_m: 10
+  max_match_dist_m: 18
+  history_window: 3
+  virtual_score_base: 0.5
+  debug: false
+
+# Decision geometry (units consistent with point cloud / lock chamber coordinates)
+geometry:
+  chamber_x_range: [39.7, 62.7]
+  chamber_y_range: [0, 102.4]
+  gate_y_range: [19.078, 23.002]
+
+# Output directory
+output:
+  root: "./outputs"
+  
+fusion:
+  iou3d: 0.3   # 3D BEV rotated IoU threshold
+  vote3d: 0.3  # 3D majority voting ratio
+  iou2d: 0.5   # 2D IoU threshold
+  vote2d: 0.5  # 2D majority voting ratio
+
+gate_state:
+  mode: "width"   # width / 2d / bev_area
+
+gate_width:
+  closed_width_m: 23.0      # Reference closed-gate width (m)
+  closed_tol_m: 0.3         # Tolerance for CLOSED state judgment (m)
+  trend_frames: 5           # Multi-frame trend window
+  median_window: 3          # Width smoothing window
+  slope_eps_m: 0.25         # Threshold for trend validity (m)
+  confirm_frames: 2         # Consecutive confirmation frames for CLOSED
+  open_min_width_m: 0.5     # Width threshold for OPEN state (m)
+  min_valid_frames: 3       # Minimum number of valid frames
+  fallback_to_2d: false     # Whether to fall back to the 2D-based method
+  
+  
+gate_2d:
+  trend_frames: 5
+
+gate_bev:
+  trend_frames: 5
+
+
+
