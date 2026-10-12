@@ -1,4 +1,6 @@
 import os
+import argparse
+import ast
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,21 +17,33 @@ def pick_first_existing(paths):
     return paths[0]
 
 
-labels_path = pick_first_existing([
+parser = argparse.ArgumentParser(description='Frame/event evaluation with the original segment-wise matching protocol')
+parser.add_argument('--cfg', help='Accepted for compatibility; warning settings are applied by loitering_warning.py')
+parser.add_argument('--labels-per-frame')
+parser.add_argument('--pred-frame')
+parser.add_argument('--out-dir', default='outputs/eval/plots')
+parser.add_argument('--metrics-only', action='store_true', help='Write metrics/CI CSVs without regenerating figures')
+parser.add_argument('--bootstrap-replicates', type=int, default=50000)
+parser.add_argument('--bootstrap-seed', type=int, default=20261012)
+args = parser.parse_args()
+if args.bootstrap_replicates < 0:
+    parser.error('--bootstrap-replicates must be nonnegative')
+
+labels_path = args.labels_per_frame or pick_first_existing([
     "outputs/loitering_labels/labels_per_frame.csv",
     "labels_per_frame.csv",
     "./labels_per_frame.csv",
     "/mnt/data/labels_per_frame.csv",
 ])
-pred_path = pick_first_existing([
+pred_path = args.pred_frame or pick_first_existing([
     "outputs/loitering_warning/pred_frame.csv",
     "pred_frame.csv",
     "./pred_frame.csv",
     "/mnt/data/pred_frame.csv",
 ])
 
-lab = pd.read_csv(labels_path)
-prd = pd.read_csv(pred_path)
+lab = pd.read_csv(labels_path, dtype={'frame_id':str})
+prd = pd.read_csv(pred_path, dtype={'frame_id':str})
 lab.columns = [c.strip() for c in lab.columns]
 prd.columns = [c.strip() for c in prd.columns]
 
@@ -42,11 +56,48 @@ if "timestamp" in prd.columns:
 use_full = all(c in lab.columns for c in ["segment", "frame_id", "timestamp"]) and \
            all(c in prd.columns for c in ["segment", "frame_id", "timestamp"])
 if use_full:
-    m = pd.merge(lab, prd, on=["segment", "frame_id", "timestamp"], how="inner", suffixes=("_gt", "_pred"))
+    keys = ['segment','frame_id','timestamp']
+    if lab['timestamp'].isna().any() or prd['timestamp'].isna().any():
+        raise ValueError('Invalid evaluation timestamps')
+    if lab.duplicated(keys).any() or prd.duplicated(keys).any():
+        raise ValueError('Duplicate evaluation frame keys')
+    if set(map(tuple,lab[keys].to_numpy())) != set(map(tuple,prd[keys].to_numpy())):
+        raise ValueError('GT/prediction frame coverage differs; refusing silent inner-join row dropping')
+    m = pd.merge(lab, prd, on=keys, how='inner', validate='one_to_one', suffixes=('_gt','_pred'))
 else:
     m = pd.merge(lab, prd, on=["segment", "frame_id"], how="inner", suffixes=("_gt", "_pred"))
     if "timestamp_gt" in m.columns:
         m["timestamp"] = pd.to_datetime(m["timestamp_gt"], errors="coerce")
+
+if args.metrics_only:
+    # Load only the reusable evaluator functions; avoid module-level plotting.
+    with open(__file__, encoding='utf-8') as source:
+        tree = ast.parse(source.read())
+    names = {'norm','normalize_series','bin_loiter','build_positive_episodes',
+             'interval_iou','interval_overlap_ratio','match_events',
+             'calc_frame_binary_metrics','collect_loiter_eval','bootstrap_event_intervals'}
+    selected = [node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
+    namespace = dict(np=np,pd=pd,POS='LOITERING')
+    exec(compile(ast.Module(body=selected,type_ignores=[]),__file__,'exec'),namespace)
+    os.makedirs(args.out_dir,exist_ok=True)
+    outputs = [[] for _ in range(5)]
+    gt_col = 'status_gt' if 'status_gt' in m.columns else 'status'
+    for col in ['status_pre','status_kf']:
+        if col not in m:
+            continue
+        values = namespace['collect_loiter_eval'](m,gt_col,col,col)
+        for destination,value in zip(outputs,values):
+            destination.append(value)
+    if not outputs[0]:
+        raise ValueError('Prediction CSV must contain status_pre or status_kf')
+    for name,parts in zip(['frame_overall','event_overall','frame_segment','event_segment','event_matches'],outputs):
+        pd.concat(parts,ignore_index=True).to_csv(os.path.join(args.out_dir,name+'.csv'),index=False)
+    if args.bootstrap_replicates > 0:
+        ci = namespace['bootstrap_event_intervals'](pd.concat(outputs[3],ignore_index=True),
+            args.bootstrap_replicates,args.bootstrap_seed)
+        ci.to_csv(os.path.join(args.out_dir,'event_confidence_intervals.csv'),index=False)
+    print('[OK] Metrics only:',args.out_dir)
+    raise SystemExit(0)
 
 segs = sorted([s for s in m["segment"].dropna().unique().tolist()])[:18]
 rows, cols = 6, 3
@@ -84,7 +135,7 @@ def bin_loiter(s):
     return s.map(lambda x: 1 if norm(x) == POS else 0).astype(float)
 
 
-out_dir = "outputs/eval/plots"
+out_dir = args.out_dir
 os.makedirs(out_dir, exist_ok=True)
 
 # =========================
@@ -667,7 +718,19 @@ def collect_loiter_eval(df, gt_col, pred_col, pred_name):
             inter = max(0, min(g1, p1) - max(g0, p0) + 1)
             union = (g1 - g0 + 1) + (p1 - p0 + 1) - inter
             overlap_gt = interval_overlap_ratio((g0, g1), (p0, p1))
+            time_metrics = {}
+            if 'timestamp' in g.columns:
+                gs,ge = pd.Timestamp(g.loc[g0,'timestamp']),pd.Timestamp(g.loc[g1,'timestamp'])
+                ps,pe = pd.Timestamp(g.loc[p0,'timestamp']),pd.Timestamp(g.loc[p1,'timestamp'])
+                union_s = (max(ge,pe)-min(gs,ps)).total_seconds()
+                intersection_s = max(0.0,(min(ge,pe)-max(gs,ps)).total_seconds())
+                time_metrics = dict(onset_delay_s=(ps-gs).total_seconds(),
+                    end_delay_s=(pe-ge).total_seconds(), gt_duration_s=(ge-gs).total_seconds(),
+                    pred_duration_s=(pe-ps).total_seconds(),
+                    duration_error_s=((pe-ps)-(ge-gs)).total_seconds(),
+                    temporal_iou=intersection_s/union_s if union_s>0 else np.nan)
             rows_event_match.append({
+                **time_metrics,
                 "segment": seg,
                 "method": pred_name,
                 "gt_start": g0,
@@ -723,9 +786,61 @@ def collect_loiter_eval(df, gt_col, pred_col, pred_name):
         "mean_sync_iou": event_match_df["sync_iou"].mean() if not event_match_df.empty else np.nan,
         "mean_sync_ratio_gt": event_match_df["sync_ratio_gt"].mean() if not event_match_df.empty else np.nan,
         "mean_duration_error": event_match_df["duration_error_frames"].mean() if not event_match_df.empty else np.nan,
+        # Keep legacy inclusive-frame values above; physical time metrics are
+        # explicitly separate and never change event matching decisions.
+        "mean_onset_delay_s": event_match_df['onset_delay_s'].mean() if 'onset_delay_s' in event_match_df else np.nan,
+        "mean_temporal_iou": event_match_df['temporal_iou'].mean() if 'temporal_iou' in event_match_df else np.nan,
+        "mean_duration_error_s": event_match_df['duration_error_s'].mean() if 'duration_error_s' in event_match_df else np.nan,
     }
 
     return pd.DataFrame([overall_frame]), pd.DataFrame([overall_event]), frame_seg_df, event_seg_df, event_match_df
+
+
+def bootstrap_event_intervals(event_segments, replicates=50000, seed=20261012):
+    """Paired whole-segment percentile bootstrap; never resample individual frames.
+
+    Intervals describe the observed clips, not independent-scene generalization.
+    Zero observed FN makes bootstrap recall degenerate. Wilson recall bounds
+    are also provided as a descriptive independent-event binomial sensitivity.
+    """
+    if replicates <= 0:
+        raise ValueError('replicates must be positive')
+    segments = sorted(event_segments['segment'].unique())
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0,len(segments),size=(replicates,len(segments)))
+    result = []
+    for method,group in event_segments.groupby('method',sort=False):
+        group = group.set_index('segment').reindex(segments)
+        if group[['tp_events','fp_events','fn_events']].isna().any().any():
+            raise ValueError('Methods must use the same segment set')
+        counts = group[['tp_events','fp_events','fn_events']].to_numpy(dtype=int)
+        sampled = counts[draws].sum(axis=1)
+        tp,fp,fn = sampled.T
+        original_tp,original_fp,original_fn = counts.sum(axis=0)
+        row = dict(method=method,gt_events=int(original_tp+original_fn),
+            pred_events=int(original_tp+original_fp),tp_events=int(original_tp),
+            fp_events=int(original_fp),fn_events=int(original_fn),
+            bootstrap_replicates=replicates,bootstrap_seed=seed,n_segments=len(segments))
+        for name,numerator,denominator,point_n,point_d in [
+            ('precision',tp,tp+fp,original_tp,original_tp+original_fp),
+            ('recall',tp,tp+fn,original_tp,original_tp+original_fn),
+            ('f1',2*tp,2*tp+fp+fn,2*original_tp,2*original_tp+original_fp+original_fn)]:
+            values = np.full(replicates,np.nan)
+            np.divide(numerator,denominator,out=values,where=denominator>0)
+            valid = values[np.isfinite(values)]
+            low,high = np.quantile(valid,[.025,.975]) if len(valid) else (np.nan,np.nan)
+            row.update({name:float(point_n/point_d) if point_d else np.nan,
+                name+'_ci_lower':float(low),name+'_ci_upper':float(high),name+'_valid_replicates':len(valid)})
+        n = original_tp+original_fn
+        if n:
+            z=1.959963984540054; p=original_tp/n; scale=1+z*z/n
+            centre=(p+z*z/(2*n))/scale
+            radius=z*np.sqrt(p*(1-p)/n+z*z/(4*n*n))/scale
+            row.update(recall_wilson_lower=float(max(0,centre-radius)),
+                       recall_wilson_upper=float(min(1,centre+radius)))
+        row['ci_scope'] = 'Empirical segment-cluster bootstrap; Wilson assumes independent events'
+        result.append(row)
+    return pd.DataFrame(result)
 
 
 def draw_loiter_frame_counts(ax, frame_overall_df):
@@ -1062,6 +1177,9 @@ if status_gt and status_kf and status_pre and status_gt in m.columns and status_
     loiter_frame_seg_df = pd.concat(frame_seg_list, ignore_index=True)
     loiter_event_seg_df = pd.concat(event_seg_list, ignore_index=True)
     loiter_event_match_df = pd.concat(event_match_list, ignore_index=True)
+    if args.bootstrap_replicates > 0:
+        bootstrap_event_intervals(loiter_event_seg_df,args.bootstrap_replicates,args.bootstrap_seed).to_csv(
+            os.path.join(out_dir,'event_confidence_intervals.csv'),index=False)
 
     fig, ax = plt.subplots(figsize=(7.4, 5.6))
     draw_loiter_frame_counts(ax, loiter_frame_overall_df)

@@ -18,6 +18,7 @@ from matplotlib.patches import Polygon, Rectangle
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 import csv
+import time
 
 from make_loitering_labels import (
     load_config,
@@ -25,6 +26,7 @@ from make_loitering_labels import (
     FrameInfo,
     compute_gate_states_for_segments,  
     track_segment,
+    occupancy_ratio,
     #build_loiter_timeline as _orig_build_loiter_timeline  
 )
 
@@ -829,13 +831,19 @@ def _collect_events_and_timeline(seg, timeline, entry_events, exit_events, exit_
 def _is_virtual_ship_det(d):
     if not isinstance(d, dict):
         return False
-    if bool(d.get('is_virtual', False)):
-        return True
+    flag = d.get('is_virtual', False)
+    if not isinstance(flag, bool):
+        raise ValueError('is_virtual must be a JSON boolean')
     tag = str(d.get('virtual_tag', '')).strip().lower()
     src = str(d.get('virtual_source', '')).strip().lower()
-    if 'virtual' in tag or 'virtual' in src:
-        return True
-    return False
+    if tag and tag != 'virtual_ship_3d':
+        raise ValueError('Unknown virtual vessel provenance tag')
+    if src and src != 'temporal_extrapolation':
+        raise ValueError('Unknown virtual vessel provenance source')
+    marked = tag == 'virtual_ship_3d' or src == 'temporal_extrapolation'
+    if 'is_virtual' in d and not flag and marked:
+        raise ValueError('Conflicting virtual vessel provenance')
+    return flag or marked
 
 
 def draw_loitering_planview(fi, pts, dets3, det2d, img_path, status, reason, num_ships, cfg, out_path, events_text=""):
@@ -929,11 +937,75 @@ def draw_loitering_planview(fi, pts, dets3, det2d, img_path, status, reason, num
 
 # --------------------------- main flow ---------------------------
 
-def run(fused_json_path, config_path, debug_events=False, viz=False):
+def _trajectory_baseline_states(frame_times, point_rows, settings):
+    """Motion-only dwell; inputs contain timestamps/IDs/positions, never labels or gates.
+
+    Positions retain the millimetre precision of pred_traj_xy.csv used in the
+    published baseline experiment. IDs and clocks are reset for each segment.
+    """
+    speed_limit = float(settings.get('speed_threshold_mps', 0.2))
+    dwell_limit = float(settings.get('dwell_seconds', 60.0))
+    gap_limit = float(settings.get('max_gap_seconds', 5.0))
+    plausible = float(settings.get('max_plausible_speed_mps', 5.0))
+    if not all(math.isfinite(v) for v in (speed_limit,dwell_limit,gap_limit,plausible)) or \
+            speed_limit < 0 or dwell_limit <= 0 or gap_limit <= 0 or plausible <= speed_limit:
+        raise ValueError('Invalid trajectory baseline settings')
+    points = defaultdict(list)
+    for row in point_rows:
+        if row[-2] == '' or row[-1] == '':
+            continue
+        points[row[3]].append((row[1], float(f'{float(row[-2]):.3f}'),
+                               float(f'{float(row[-1]):.3f}')))
+    history = {}
+    predictions = []
+    for now in frame_times:
+        positive = False
+        current = points[now.isoformat()]
+        duplicates = defaultdict(int)
+        for tid, _, _ in current:
+            duplicates[tid] += 1
+        for tid, x, y in current:
+            if duplicates[tid] > 1 or not (math.isfinite(x) and math.isfinite(y)):
+                history.pop(tid, None)
+                continue
+            low_start = None
+            previous = history.get(tid)
+            if previous:
+                before, px, py, prior_start = previous
+                dt = (now - before).total_seconds()
+                if 0 < dt <= gap_limit:
+                    speed = math.hypot(x-px, y-py) / dt
+                    if speed <= plausible and speed <= speed_limit:
+                        low_start = prior_start if prior_start is not None else before
+            history[tid] = (now, x, y, low_start)
+            if low_start is not None and (now-low_start).total_seconds() >= dwell_limit:
+                positive = True
+        predictions.append('LOITERING' if positive else 'OK')
+    return predictions
+
+
+def run(fused_json_path, config_path, debug_events=False, viz=False,
+        method='proposed', completion=None, timing=False):
+    """Run saved-observation reasoning, optionally removing proven virtual vessels.
+
+    timing reports amortized CPU backend wall time, not detector/end-to-end latency.
+    Baseline states use compatible Pre/KF columns, identical for either baseline.
+    """
+    started = time.perf_counter_ns() if timing else None
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError('Warning configuration not found: ' + str(config_path))
     cfg = load_config(config_path)
+    if method not in ('proposed', 'trajectory', 'framewise'):
+        raise ValueError('Unknown warning method')
+    completion_enabled = bool(cfg.get('virtual_ship_repair', {}).get('enabled', True))
+    if completion is not None:
+        completion_enabled = bool(completion)
 
     out_root = cfg.get('output', {}).get('root', './outputs')
-    out_dir = os.path.join(out_root, 'loitering_warning')
+    suffix = '' if method == 'proposed' else '_' + method
+    if not completion_enabled:
+        suffix += '_without_completion'
+    out_dir = os.path.join(out_root, 'loitering_warning' + suffix)
     os.makedirs(out_dir, exist_ok=True)
     vis_dir = os.path.join(out_dir, 'vis')
     if viz:
@@ -958,6 +1030,20 @@ def run(fused_json_path, config_path, debug_events=False, viz=False):
     # Read fused results
     with open(fused_json_path, 'r', encoding='utf-8') as f:
         fused_data = json.load(f)
+    removed_virtual = 0
+    if not completion_enabled:
+        ship_labels = set(cfg['labels']['ships'])
+        for info in fused_data.values():
+            retained = []
+            for detection in info.get('det3d', []):
+                if detection.get('label') in ship_labels and _is_virtual_ship_det(detection):
+                    removed_virtual += 1
+                else:
+                    retained.append(detection)
+            # Preserve 2D/gate detections, timestamps and all other metadata.
+            info['det3d'] = retained
+
+    audit_rows = []
 
     # Build frames_by_segment (used only for gate state / tracking)
     frames_by_segment = defaultdict(list)
@@ -1021,6 +1107,14 @@ def run(fused_json_path, config_path, debug_events=False, viz=False):
          _dummy,
          inside_counts,
          per_frame_bboxinfo) = track_segment(frames, cfg)
+        if cfg.get('debug', {}).get('export_occupancy_audit', False):
+            for (fi, _), boxes, count in zip(per_frame_ship_tids, per_frame_bboxinfo, inside_counts):
+                for tid, inside, x, y, width, length, yaw in boxes:
+                    audit_rows.append(dict(segment=seg, frame_id=fi.frame_id,
+                        timestamp=fi.timestamp.isoformat(), tid=tid, inside=int(inside),
+                        inside_count=count, rho=occupancy_ratio(x,y,width,length,yaw,
+                            cfg['geometry']['chamber_x_range'],
+                            [cfg['geometry']['gate_y_range'][0],cfg['geometry']['chamber_y_range'][1]])))
 
         
         # ===== First keep an unfiltered copy (make as few assumptions about the internal structure as possible) =====
@@ -1072,6 +1166,19 @@ def run(fused_json_path, config_path, debug_events=False, viz=False):
         timeline = build_loiter_timeline(
             frames, per_frame_ship_tids, exit_events, exit_behaviors_kf, inside_counts_kf, cfg
         )
+        if method != 'proposed':
+            if method == 'trajectory':
+                states = _trajectory_baseline_states(
+                    [fi.timestamp for fi in frames],
+                    _traj_to_rows(seg, per_frame_ship_tids, orig_long_traj),
+                    cfg.get('baselines', {}))
+                reason = 'Trajectory-only low-speed dwell baseline'
+            else:
+                states = ['LOITERING' if fi.gate_state == 'OPEN' and count > 0 else 'OK'
+                          for fi, count in zip(frames, orig_inside_counts)]
+                reason = 'Current gate OPEN and chamber occupied baseline'
+            timeline = [(fi, state, reason, '-') for fi, state in zip(frames, states)]
+            timeline_pre = list(timeline)
 
         # ====== Export six files: three pre-KF files + three post-KF files (with the original names) ======
         # 1) Post-KF (keep the original filenames)
@@ -1296,16 +1403,38 @@ def run(fused_json_path, config_path, debug_events=False, viz=False):
 
     print("[OK] Traj CSV saved to:", traj_csv)
     print("[OK] Frame CSV saved to:", frame_csv)
+    with open(os.path.join(out_dir, 'run_metadata.json'), 'w', encoding='utf-8') as f:
+        json.dump(dict(method=method, completion_enabled=completion_enabled,
+            removed_virtual_boxes=removed_virtual, frames=len(kf_frame_map),
+            geometry=cfg['geometry'], thresholds=cfg['thresholds'],
+            gate_width=cfg.get('gate_width', {}), baselines=cfg.get('baselines', {})), f, indent=2)
+    if audit_rows:
+        with open(os.path.join(out_dir, 'occupancy_audit.csv'), 'w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(audit_rows[0]))
+            writer.writeheader(); writer.writerows(audit_rows)
+    if timing:
+        elapsed_ms = (time.perf_counter_ns()-started) / 1e6
+        result = dict(backend_wall_ms=elapsed_ms, n_frames=len(kf_frame_map),
+            amortized_backend_ms_per_frame=elapsed_ms/len(kf_frame_map) if kf_frame_map else None,
+            detector_and_fusion_inference_included=False,
+            scope='Saved-observation CPU backend, including input/output; excludes module imports.')
+        with open(os.path.join(out_dir, 'backend_timing.json'), 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2)
+        print('[TIMING] Backend only:', result)
 
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='Loitering ship warning visualization v3.1 (2D gate trends + Kalman)')
     ap.add_argument('--fused-json', default='outputs/fused_2d3d/fused_2d3d_virtual.json')
-    ap.add_argument('--cfg', default='config.yaml')
+    ap.add_argument('--cfg', default='configs/config.yaml')
     ap.add_argument('--debug-events', action='store_true', help='The left upper information bar displays the "entry/exit/exit_behavior" events of this frame.')
     ap.add_argument('--viz', action='store_true', help='Enable visual rendering (default is off)')
+    ap.add_argument('--method', choices=['proposed','trajectory','framewise'], default='proposed')
+    ap.add_argument('--without-completion', action='store_true', help='Remove marked virtual vessels before tracking')
+    ap.add_argument('--timing', action='store_true', help='Measure backend wall time; excludes the twelve detectors/fusion')
     args = ap.parse_args()
-    run(args.fused_json, args.cfg, debug_events=args.debug_events, viz=args.viz)
+    run(args.fused_json, args.cfg, debug_events=args.debug_events, viz=args.viz,
+        method=args.method, completion=False if args.without_completion else None, timing=args.timing)
 
 
 if __name__ == '__main__':

@@ -9,7 +9,7 @@ import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import cos, sin, pi
+from math import cos, sin, pi, isfinite
 from typing import List, Tuple, Optional
 
 try:
@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
         "ships": ["Fully_loaded_cargo_ship", "Fully_loaded_container_ship", "Unladen_cargo_ship"],
     },
     "geometry": {
+        "theta_occ": 0.0,
         "chamber_x_range": [39.7, 62.7],
         "chamber_y_range": [0.0, 102.4],
         "gate_y_range": [19.078, 23.002],
@@ -186,6 +187,65 @@ def oriented_rect_intersects_aabb(cx, cy, w, l, yaw, xr, yr):
     if not overlap_on(0.0, 1.0): return False
     return True
 
+# Exact rotated-box clipping; no enclosing-AABB approximation.
+
+def _valid(cx,cy,w,l,yaw,xr,yr):
+    try:
+        return (all(isfinite(float(v)) for v in (cx,cy,w,l,yaw,*xr,*yr))
+                and w>0 and l>0 and len(xr)==len(yr)==2
+                and xr[1]>xr[0] and yr[1]>yr[0])
+    except (TypeError,ValueError,OverflowError):return False
+
+def vessel_corners(cx,cy,w,l,yaw):
+    """CCW corners; length axis matches the original track geometry."""
+    ux,uy=cos(yaw),sin(yaw);vx,vy=-uy,ux
+    return [(cx+a*l*.5*ux+b*w*.5*vx,cy+a*l*.5*uy+b*w*.5*vy)
+            for a,b in [(-1,-1),(1,-1),(1,1),(-1,1)]]
+
+def polygon_area(poly):
+    if len(poly)<3:return 0.0
+    ox,oy=poly[0]
+    p=[(x-ox,y-oy) for x,y in poly]
+    return abs(sum(a[0]*b[1]-b[0]*a[1] for a,b in zip(p,p[1:]+p[:1])))*.5
+
+def _clip(poly,axis,bound,lower):
+    if not poly:return []
+    result=[]
+    inside=lambda p:p[axis]>=bound if lower else p[axis]<=bound
+    before=poly[-1];before_inside=inside(before)
+    for after in poly:
+        after_inside=inside(after)
+        if before_inside!=after_inside:
+            fraction=(bound-before[axis])/(after[axis]-before[axis])
+            q=[before[k]+fraction*(after[k]-before[k]) for k in [0,1]]
+            q[axis]=bound
+            result.append(tuple(q))
+        if after_inside:result.append(after)
+        before,before_inside=after,after_inside
+    return result
+
+def intersection_area(cx,cy,w,l,yaw,xr,yr):
+    yaw=0.0 if yaw is None else yaw
+    if not _valid(cx,cy,w,l,yaw,xr,yr):return 0.0
+    poly=vessel_corners(cx,cy,w,l,yaw)
+    for axis,bound,lower in [(0,xr[0],True),(0,xr[1],False),(1,yr[0],True),(1,yr[1],False)]:
+        poly=_clip(poly,axis,bound,lower)
+    return min(w*l,max(0.0,polygon_area(poly)))
+
+def occupancy_ratio(cx,cy,w,l,yaw,xr,yr):
+    yaw=0.0 if yaw is None else yaw
+    if not _valid(cx,cy,w,l,yaw,xr,yr):return 0.0
+    return intersection_area(cx,cy,w,l,yaw,xr,yr)/(w*l)
+
+def vessel_inside_chamber(cx,cy,w,l,yaw,xr,yr,theta_occ=0.0):
+    if not isfinite(theta_occ) or not 0<=theta_occ<=1:
+        raise ValueError('theta_occ must be finite and within [0,1]')
+    yaw=0.0 if yaw is None else yaw
+    if not _valid(cx,cy,w,l,yaw,xr,yr):return False
+    rho = occupancy_ratio(cx,cy,w,l,yaw,xr,yr)
+    # Manuscript Eq. (9): a boundary-only contact has rho=0 and is outside.
+    return rho > 0.0 and rho >= theta_occ
+
 def compute_gate_states(frames: List[FrameInfo], cfg: dict) -> None:
     W = int(cfg["thresholds"]["gate_trend_window"])   
     open_min = float(cfg["thresholds"]["gate_opening_min_width_m"])
@@ -257,8 +317,11 @@ def track_segment(frames: List[FrameInfo], cfg: dict):
     y_max = float(cfg["geometry"]["chamber_y_range"][1])
     chamber_y_rect = (y_min, y_max)
 
+    theta_occ = float(cfg["geometry"].get("theta_occ", 0.0))
+
     def inside_chamber_fn(xy, w, l, yaw):
-        return oriented_rect_intersects_aabb(xy[0], xy[1], w, l, yaw, chamber_x, chamber_y_rect)
+        return vessel_inside_chamber(xy[0], xy[1], w, l, yaw,
+                                     chamber_x, chamber_y_rect, theta_occ)
 
     max_gap = timedelta(seconds=float(cfg["thresholds"]["track_max_time_gap_s"]))
     confirm_hits = int(cfg["thresholds"]["track_confirm_hits"])
