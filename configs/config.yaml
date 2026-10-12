@@ -54,7 +54,7 @@ pcdet_models:
   - name: "second"
     config: "/path/to/pcdet_models/config/second.yaml"
     checkpoint: "/path/to/pcdet_models/checkpoint/second.pth"
-    core_thr: 0.40
+    score_thr: 0.40
 
   - name: "dsvt_voxel"
     config: "/path/to/pcdet_models/config/dsvt_voxel.yaml"
