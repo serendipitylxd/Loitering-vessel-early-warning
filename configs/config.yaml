@@ -94,9 +94,21 @@ virtual_ship_repair:
 
 # Decision geometry (units consistent with point cloud / lock chamber coordinates)
 geometry:
+  theta_occ: 0.0  # Require positive intersection area; only boundary contact is outside.
   chamber_x_range: [39.7, 62.7]
   chamber_y_range: [0, 102.4]
   gate_y_range: [19.078, 23.002]
+
+# Fixed operational reference; also configurable for sensitivity analysis.
+thresholds:
+  loiter_window_s: 60.0
+
+# Motion-only baseline settings, declared independently of test labels.
+baselines:
+  speed_threshold_mps: 0.2
+  dwell_seconds: 60.0
+  max_gap_seconds: 5.0
+  max_plausible_speed_mps: 5.0
 
 # Output directory
 output:
